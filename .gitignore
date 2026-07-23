@@ -1,0 +1,7 @@
+dist/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+# local hermes-agent checkout for tests (see tests/conftest.py)
+hermes-agent/

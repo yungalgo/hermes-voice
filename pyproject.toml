@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-voice"
+version = "0.1.0"
+description = "Realtime voice platform plugin for hermes-agent: Daily WebRTC transport, Deepgram Flux streaming STT + turn detection, Cartesia streaming TTS, in-process barge-in."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+# hermes-agent itself is deliberately NOT a dependency: the plugin always
+# runs in-process inside a hermes-agent install, which provides the
+# gateway/hermes_cli/run_agent modules at runtime.
+dependencies = [
+  "daily-python==0.29.1",
+  "websockets>=14,<16",  # >=14 for connect(additional_headers=...)
+]
+
+[project.urls]
+Upstream-PR = "https://github.com/NousResearch/hermes-agent/pull/51827"
+
+# hermes-agent plugin discovery: importlib.metadata entry point in the
+# "hermes_agent.plugins" group. hermes imports this module and calls its
+# register(ctx). The "-platform" suffix follows the hermes convention that
+# derives the gateway platform name ("voice") from the plugin name.
+[project.entry-points."hermes_agent.plugins"]
+voice-platform = "hermes_voice"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hermes_voice"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"hermes_voice/plugin.yaml" = "hermes_voice/plugin.yaml"
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
