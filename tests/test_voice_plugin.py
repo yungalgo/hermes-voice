@@ -11,6 +11,7 @@ see HERMES_AGENT_SRC).
 
 from __future__ import annotations
 import asyncio
+import json
 import threading
 
 from unittest.mock import AsyncMock, MagicMock
@@ -466,6 +467,47 @@ async def test_join_failure_posts_error_then_ended():
         {"type": "error", "callId": "call-1", "code": "agent_join_failed"},
         {"type": "ended", "callId": "call-1", "reason": "agent_join_failed"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_voice_loop_failure_posts_error_then_ends_call():
+    adapter = object.__new__(_adapter.VoiceAdapter)
+    adapter._call_lock = asyncio.Lock()
+    control_client = MagicMock()
+    control_client.post_event = AsyncMock()
+    adapter._control = control_client
+
+    async def fail():
+        raise RuntimeError("tts failed")
+
+    task = asyncio.create_task(fail())
+    with pytest.raises(RuntimeError, match="tts failed"):
+        await task
+    adapter._active_call = {"task": task, "call_id": "call-1"}
+    adapter._end_call_locked = AsyncMock()
+
+    await adapter._handle_voice_task_failure(task)
+
+    control_client.post_event.assert_awaited_once_with({
+        "type": "error", "callId": "call-1",
+        "code": "voice_runtime_error",
+    })
+    adapter._end_call_locked.assert_awaited_once_with("voice-runtime-error")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_voice_loop_does_not_report_runtime_error():
+    adapter = object.__new__(_adapter.VoiceAdapter)
+    adapter._handle_voice_task_failure = AsyncMock()
+    task = asyncio.create_task(asyncio.Event().wait())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    adapter._voice_task_done(task)
+    await asyncio.sleep(0)
+
+    adapter._handle_voice_task_failure.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1324,6 +1366,90 @@ def test_cartesia_request_basic_payload():
     assert "flush" not in req
     assert "generation_config" not in req
 
+
+@pytest.mark.asyncio
+async def test_cartesia_socket_uses_current_version_and_header(monkeypatch):
+    import websockets
+
+    captured = {}
+
+    class FakeWebSocket:
+        closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def close(self):
+            self.closed = True
+
+    async def connect(url, **kwargs):
+        captured.update(url=url, kwargs=kwargs)
+        return FakeWebSocket()
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    client = cartesia.CartesiaTTSClient("secret-key", "voice-1")
+
+    await client._ensure_connected()
+    await asyncio.sleep(0)
+
+    assert captured["url"] == (
+        "wss://api.cartesia.ai/tts/websocket?cartesia_version=2026-03-01")
+    assert captured["kwargs"]["additional_headers"] == {
+        "X-API-Key": "secret-key"}
+    assert "secret-key" not in captured["url"]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_cartesia_contextless_terminal_frames_complete_active_turn():
+    class OneThenBlockWebSocket:
+        def __init__(self, message):
+            self._message = json.dumps(message)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._message is not None:
+                message = self._message
+                self._message = None
+                return message
+            await asyncio.Event().wait()
+
+    for message, expected_error in [
+        ({"type": "error", "message": "invalid voice specification"},
+         "invalid voice specification"),
+        ({"type": "done", "done": True}, None),
+    ]:
+        client = cartesia.CartesiaTTSClient("k", "voice-1")
+        turn = client.new_turn(AsyncMock())
+        client._active = turn
+        recv_task = asyncio.create_task(
+            client._recv_loop(OneThenBlockWebSocket(message)))
+
+        await asyncio.wait_for(turn._done.wait(), timeout=1)
+
+        assert turn._error == expected_error
+        recv_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await recv_task
+
+
+
+@pytest.mark.asyncio
+async def test_cartesia_turn_end_raises_provider_error():
+    client = cartesia.CartesiaTTSClient("k", "voice-1")
+    client._send = AsyncMock()
+    turn = client.new_turn(AsyncMock())
+    client._active = turn
+    turn._error = "invalid voice specification"
+    turn._done.set()
+
+    with pytest.raises(RuntimeError, match="invalid voice specification"):
+        await turn.end()
 
 def test_cartesia_request_flush_maps_to_flag():
     c = cartesia.CartesiaTTSClient("k", "voice-1")

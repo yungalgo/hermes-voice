@@ -46,7 +46,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 logger = logging.getLogger(__name__)
 
 WS_URL = "wss://api.cartesia.ai/tts/websocket"
-CARTESIA_VERSION = "2024-11-13"
+CARTESIA_VERSION = "2026-03-01"
 OUTPUT_SAMPLE_RATE = 48000          # matches the Daily transport (no resample)
 DEFAULT_MODEL = "sonic-3.5"
 FLUSH_SENTINEL = "<flush>"          # force-synth token the turn loop emits
@@ -114,11 +114,11 @@ class CartesiaTTSClient:
             self._reconnects += 1
             logger.warning("voice/tts cartesia: socket was closed; "
                            "reconnecting (#%d this call)", self._reconnects)
-        url = f"{WS_URL}?api_key={self._api_key}&cartesia_version={CARTESIA_VERSION}"
+        url = f"{WS_URL}?cartesia_version={CARTESIA_VERSION}"
         self._ws = await websockets.connect(
-            url, max_size=None,
-            ping_interval=PING_INTERVAL_S, ping_timeout=PING_TIMEOUT_S,
-            close_timeout=2)
+            url, additional_headers={"X-API-Key": self._api_key},
+            max_size=None, ping_interval=PING_INTERVAL_S,
+            ping_timeout=PING_TIMEOUT_S, close_timeout=2)
         self._recv_task = asyncio.create_task(self._recv_loop(self._ws))
 
     async def _recv_loop(self, ws) -> None:
@@ -127,7 +127,13 @@ class CartesiaTTSClient:
                 msg = json.loads(raw)
                 mtype = msg.get("type")
                 active = self._active
-                if active is None or msg.get("context_id") != active.context_id:
+                if active is None:
+                    continue
+                context_id = msg.get("context_id")
+                if context_id is None:
+                    if mtype not in {"done", "error"}:
+                        continue
+                elif context_id != active.context_id:
                     continue  # stale (previous/barged-in turn) — never forward
                 if mtype == "chunk":
                     if not active._muted:
@@ -142,7 +148,9 @@ class CartesiaTTSClient:
                 elif mtype == "done":
                     active._done.set()
                 elif mtype == "error":
-                    active._error = msg.get("error") or "error"
+                    active._error = (
+                        msg.get("error") or msg.get("message")
+                        or msg.get("title") or "error")
                     logger.warning(
                         "voice/tts cartesia: server error ctx=%s req=%s: %s",
                         msg.get("context_id"), msg.get("request_id"),
@@ -282,6 +290,8 @@ class CartesiaTTSTurn:
             pass
         try:
             await self._done.wait()
+            if self._error:
+                raise RuntimeError(f"Cartesia TTS failed: {self._error}")
         finally:
             self._log_turn()
             if self._client._active is self:

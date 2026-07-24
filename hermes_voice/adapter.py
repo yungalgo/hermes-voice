@@ -365,7 +365,44 @@ class VoiceAdapter(BasePlatformAdapter):
             }
             self._active_call["watchdog"] = asyncio.create_task(
                 self._call_watchdog(transport))
+            task.add_done_callback(self._voice_task_done)
             logger.info("voice: call started in %s", room_url)
+
+    def _voice_task_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is None:
+            return
+        logger.error(
+            "voice: turn loop failed",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        asyncio.create_task(self._handle_voice_task_failure(task))
+
+    async def _handle_voice_task_failure(self, task: asyncio.Task) -> None:
+        async with self._call_lock:
+            call = self._active_call
+            if call is None or call.get("task") is not task:
+                return
+            client = self._control
+            call_id = call.get("call_id")
+            if client is not None and call_id is not None:
+                try:
+                    await client.post_event({
+                        "type": "error",
+                        "callId": call_id,
+                        "code": "voice_runtime_error",
+                    })
+                except Exception:
+                    logger.warning(
+                        "voice: failed to publish runtime error",
+                        exc_info=True,
+                    )
+            await self._end_call_locked("voice-runtime-error")
 
     async def _handle_control_command(self, command: control.Command) -> None:
         if command["type"] == "join_room":
