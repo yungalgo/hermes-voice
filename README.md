@@ -98,10 +98,13 @@ gateway:
         eager_eot_threshold: 0.5     # Flux eager/speculative end-of-turn
         allow_interruptions: true    # barge-in when the caller starts speaking
         tts_speed: ""                # optional Cartesia speed (e.g. 1.0)
-        greeting_prompt: ""          # optional: how the agent opens the call
+        greeting_text: "Hi, how can I help?" # optional literal text spoken when the call opens
         idle_teardown_s: 60          # hang up after the caller is gone this long
         max_call_s: 1800             # hard call-duration cap
 ```
+
+`greeting_text` is literal spoken text sent directly to TTS; it is not an LLM
+instruction or prompt.
 
 ### Provider slots
 
