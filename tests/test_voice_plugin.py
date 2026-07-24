@@ -830,6 +830,147 @@ def test_supplied_session_loads_repaired_history_and_reaches_agent(monkeypatch):
     assert captured["session_db"] is session_db
 
 
+def test_voice_agent_disables_redundant_tts_tool(monkeypatch):
+    import gateway.run as gateway_run
+    import hermes_cli.tools_config as tools_config
+    import run_agent
+
+    captured = {}
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config: "model")
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_load_fallback_model", lambda: None)
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_load_reasoning_config", lambda: None)
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda config, platform: {"hermes-cli"})
+    monkeypatch.setattr(turn_loop, "resolve_voice_runtime_kwargs", lambda extra: None)
+    monkeypatch.setattr(run_agent, "AIAgent", lambda **kwargs: captured.update(kwargs))
+
+    turn_loop._create_voice_agent(
+        "session-from-web", lambda delta: None, lambda *args, **kwargs: None,
+        session_db=object(), extra={})
+
+    assert captured["disabled_toolsets"] == ["tts"]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_greeting_uses_nonpersistent_agent(monkeypatch):
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([]), _noop_tts_factory, _FakeTransport(), extra={})
+    monkeypatch.setattr(loop, "_start_turn", AsyncMock())
+    loop._stopped.set()
+
+    await loop.run()
+
+    loop._start_turn.assert_awaited_once_with(
+        turn_loop.DEFAULT_GREETING_PROMPT,
+        record_user=False,
+        persist_session=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonpersistent_greeting_persists_only_completed_assistant(monkeypatch):
+    persisted = []
+    transcripts = []
+
+    class FakeSessionDB:
+        def get_messages_as_conversation(self, session_id, **kwargs):
+            return []
+
+        def append_message(self, session_id, role, content=None):
+            persisted.append((session_id, role, content))
+
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([]),
+        lambda on_audio: asyncio.sleep(0, result=_CompletedTurnTTS()),
+        _FakeTransport(),
+        extra={},
+        session_id="session-1",
+        session_db=FakeSessionDB(),
+        on_transcript=lambda role, content: asyncio.sleep(
+            0, result=transcripts.append((role, content))),
+    )
+    persistence_modes = []
+
+    class CompletedAgent:
+        def run_conversation(self, **kwargs):
+            loop._delta_tramp("Welcome.")
+            return {"final_response": "Welcome."}
+
+        def interrupt(self, reason):
+            pass
+
+    def make_agent(*, persist_session=True):
+        persistence_modes.append(persist_session)
+        return CompletedAgent()
+
+    monkeypatch.setattr(loop, "_make_agent", make_agent)
+
+    await loop._start_turn(
+        turn_loop.DEFAULT_GREETING_PROMPT,
+        record_user=False,
+        persist_session=False,
+    )
+    await loop._turn_task
+
+    assert persistence_modes == [False, True]
+    assert persisted == [("session-1", "assistant", "Welcome.")]
+    assert loop._history == [{"role": "assistant", "content": "Welcome."}]
+    assert transcripts == [("assistant", "Welcome.")]
+
+
+@pytest.mark.asyncio
+async def test_failed_greeting_playback_persists_nothing(monkeypatch):
+    persisted = []
+    transcripts = []
+
+    class FakeSessionDB:
+        def get_messages_as_conversation(self, session_id, **kwargs):
+            return []
+
+        def append_message(self, session_id, role, content=None):
+            persisted.append((session_id, role, content))
+
+    class FailedGreetingTTS(_CompletedTurnTTS):
+        async def end(self):
+            raise RuntimeError("playback failed")
+
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([]),
+        lambda on_audio: asyncio.sleep(0, result=FailedGreetingTTS()),
+        _FakeTransport(),
+        extra={},
+        session_id="session-1",
+        session_db=FakeSessionDB(),
+        on_transcript=lambda role, content: asyncio.sleep(
+            0, result=transcripts.append((role, content))),
+    )
+
+    class CompletedAgent:
+        def run_conversation(self, **kwargs):
+            loop._delta_tramp("Welcome.")
+            return {"final_response": "Welcome."}
+
+        def interrupt(self, reason):
+            pass
+
+    monkeypatch.setattr(
+        loop, "_make_agent",
+        lambda *, persist_session=True: CompletedAgent())
+
+    await loop._start_turn(
+        turn_loop.DEFAULT_GREETING_PROMPT,
+        record_user=False,
+        persist_session=False,
+    )
+    with pytest.raises(RuntimeError, match="playback failed"):
+        await loop._turn_task
+
+    assert persisted == []
+    assert loop._history == []
+    assert transcripts == []
+
+
 @pytest.mark.asyncio
 async def test_only_confirmed_end_emits_user_final(monkeypatch):
     transcripts = []

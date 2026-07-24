@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-voice"
-version = "0.2.1"
+version = "0.2.2"
 description = "Realtime voice platform plugin for hermes-agent: Daily WebRTC transport, Deepgram Flux streaming STT + turn detection, Cartesia streaming TTS, in-process barge-in."
 readme = "README.md"
 license = "MIT"
