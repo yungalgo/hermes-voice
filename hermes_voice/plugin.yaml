@@ -1,7 +1,7 @@
 name: voice-platform
 label: Voice
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
   Realtime voice-call gateway adapter. Joins a Daily (WebRTC) room as a
   participant, streams caller audio to Deepgram Flux (streaming STT with
