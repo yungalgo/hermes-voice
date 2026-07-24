@@ -951,7 +951,7 @@ async def test_speaking_waits_for_first_outbound_fragment(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_barged_assistant_does_not_emit_final(monkeypatch):
+async def test_pre_audio_barge_carries_text_into_next_confirmed_turn(monkeypatch):
     started = threading.Event()
     released = threading.Event()
     transcripts = []
@@ -981,6 +981,39 @@ async def test_barged_assistant_does_not_emit_final(monkeypatch):
     await loop._barge_in()
 
     assert transcripts == []
+    assert loop._pending_text == ["interrupt me"]
+
+    loop._stt = _FakeFluxSTT([
+        {"event": "eager_end_of_turn", "transcript": "new request"},
+        {"event": "turn_resumed", "transcript": ""},
+        {"event": "eager_end_of_turn", "transcript": "new request corrected"},
+        {"event": "end_of_turn", "transcript": "new request corrected"},
+    ])
+    loop._spare_agent_future = None
+    captured = {}
+
+    class CompletedAgent:
+        def run_conversation(self, **kwargs):
+            captured.update(kwargs)
+            loop._delta_tramp("Completed answer.")
+            return {"final_response": "Completed answer."}
+
+        def interrupt(self, reason):
+            pass
+
+    monkeypatch.setattr(loop, "_make_agent", lambda: CompletedAgent())
+    monkeypatch.setattr(loop, "_preconstruct_agent", lambda: None)
+
+    await loop._consume_flux()
+    await loop._turn_task
+
+    carried = "interrupt me\n\nnew request corrected"
+    assert captured["user_message"] == carried
+    assert loop._history == [
+        {"role": "user", "content": carried},
+        {"role": "assistant", "content": "Completed answer."},
+    ]
+    assert loop._pending_text == []
 
 
 @pytest.mark.asyncio

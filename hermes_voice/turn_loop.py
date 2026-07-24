@@ -498,20 +498,32 @@ class VoiceTurnLoop:
                 if speaking:
                     if self._allow_interruptions:
                         self._mark("flux-barge-in", state=self._state)
+                        pending_before_barge = (
+                            list(self._pending_text) if eager_live else None)
                         await self._barge_in()
+                        if pending_before_barge is not None:
+                            # The eager transcript was speculative. Cancelling it
+                            # must not enqueue that partial text alongside the
+                            # later confirmed transcript.
+                            self._pending_text[:] = pending_before_barge
                         eager_live = False
                 elif self._spare_agent_future is None:
                     # Pre-warm the agent while the user speaks so construction
                     # (~0.5s) is off the critical path by eager/end-of-turn.
                     self._spare_agent_future = self._preconstruct_agent()
             elif kind == "eager_end_of_turn":
-                if text and self._state == LISTENING:
+                if (text and self._state == LISTENING
+                        and not self._pending_text):
                     eager_live = True
                     await self._begin_flux_turn(text, eager=True, reason="eager")
             elif kind == "turn_resumed":
                 if eager_live:
                     self._mark("flux-turn-resumed")
+                    pending_before_barge = list(self._pending_text)
                     await self._barge_in()   # cancel the speculative turn
+                    # A resumed eager transcript is superseded by the eventual
+                    # EndOfTurn transcript, so never replay the partial copy.
+                    self._pending_text[:] = pending_before_barge
                     eager_live = False
             elif kind == "end_of_turn":
                 if text:
@@ -539,10 +551,16 @@ class VoiceTurnLoop:
         if eager:
             self._tel_set("eager_start", True)
         self._mark("flux-turn-end", reason=reason, eager=eager)
+        pending_count = 0
+        if not eager and self._pending_text:
+            pending_count = len(self._pending_text)
+            text = "\n\n".join((*self._pending_text, text))
         agent_future = self._spare_agent_future
         self._spare_agent_future = None
         await self._start_turn(
             text, record_user=True, agent_future=agent_future)
+        if pending_count:
+            del self._pending_text[:pending_count]
 
     # -- agent turn ---------------------------------------------------------
 
