@@ -6,14 +6,10 @@ Standalone hermes-agent platform plugin (installed via the
 module owns plugin registration, requirement checks, and the adapter
 lifecycle.
 
-Standalone mode: this agent holds DAILY_API_KEY, creates its own private
-Daily room + a single-use meeting token at connect time, joins immediately,
-and logs the room URL for the owner to share. caller == owner.
-
-Opinionated stack: Deepgram Flux (streaming STT + model-integrated turn
-detection), Cartesia (streaming TTS, default — the per-turn TTS is built
-behind a factory so another provider can be slotted in), and the plugin's
-voice_model slot (``platforms.voice.extra.voice_model``) for generation.
+Two modes share the same Daily/STT/TTS media stack. Standalone mode creates
+and joins a private Daily room at connect time. Orchestrated mode holds an
+authenticated outbound signaling stream and joins rooms supplied by its
+controller.
 """
 
 from __future__ import annotations
@@ -30,7 +26,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from . import daily_transport, turn_loop
+from . import control, daily_transport, turn_loop
 from . import stt as stt_mod
 from . import tts as tts_mod
 
@@ -70,17 +66,15 @@ def _websockets_available() -> bool:
 
 
 def check_requirements() -> bool:
-    """Deps importable + the unconditional call keys present (cheap env read,
-    no config load): Daily (transport) and Cartesia (TTS) are needed for every
-    call. The STT key is provider-dependent (Deepgram for the default Flux,
-    Cartesia for Ink-2), so it is checked in validate_config / at connect,
-    where the platform's extra config is available."""
+    """Check dependencies and environment shared by every voice mode."""
     if not _daily_available() or not _websockets_available():
         return False
-    return bool(
-        os.getenv("DAILY_API_KEY", "").strip()
-        and os.getenv("CARTESIA_API_KEY", "").strip()
-    )
+    return bool(os.getenv("CARTESIA_API_KEY", "").strip())
+
+
+def _resolve_mode(config) -> str:
+    extra = getattr(config, "extra", None) or {}
+    return str(extra.get("mode") or "standalone").strip().lower()
 
 
 def _resolve_float_extra(extra: Dict[str, Any], key: str, default: float) -> float:
@@ -96,16 +90,39 @@ def _resolve_float_extra(extra: Dict[str, Any], key: str, default: float) -> flo
 
 
 def validate_config(config) -> bool:
-    """Config-aware readiness: transport key + the configured STT provider's
-    key. Cartesia's key is already required by check_requirements (TTS), so
-    only the default Flux path adds a key requirement here."""
-    if not os.getenv("DAILY_API_KEY", "").strip():
-        return False
+    """Validate only the selected mode and provider configuration."""
     extra = getattr(config, "extra", None) or {}
-    stt_provider = (extra.get("stt_provider") or "deepgram_flux").strip().lower()
+    mode = _resolve_mode(config)
+    if mode not in ("standalone", "orchestrated"):
+        return False
+    if not os.getenv("CARTESIA_API_KEY", "").strip():
+        return False
+    if not str(
+        extra.get("cartesia_voice_id")
+        or os.getenv("CARTESIA_VOICE_ID", "")
+    ).strip():
+        return False
+    tts_provider = str(extra.get("tts_provider") or "cartesia").strip().lower()
+    if tts_provider != "cartesia":
+        return False
+
+    stt_provider = str(
+        extra.get("stt_provider") or "deepgram_flux"
+    ).strip().lower()
     if stt_provider == "deepgram_flux":
-        return bool(os.getenv("DEEPGRAM_API_KEY", "").strip())
-    return True
+        if not os.getenv("DEEPGRAM_API_KEY", "").strip():
+            return False
+    elif stt_provider == "cartesia_ink":
+        pass
+    else:
+        return False
+
+    if mode == "standalone":
+        return bool(os.getenv("DAILY_API_KEY", "").strip())
+    return bool(
+        os.getenv("SECOND_BRAIN_SIGNALING_URL", "").strip()
+        and os.getenv("SECOND_BRAIN_SIGNALING_KEY", "").strip()
+    )
 
 
 def is_connected(config) -> bool:
@@ -121,8 +138,11 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
-        required_env=["DAILY_API_KEY", "DEEPGRAM_API_KEY", "CARTESIA_API_KEY"],
-        install_hint="pip install daily-python==0.29.1 websockets  # into hermes' venv (plugin code arrives via git, not PyPI)",
+        required_env=["CARTESIA_API_KEY"],
+        install_hint=(
+            "pip install daily-python==0.29.1 'websockets>=14,<16' "
+            "'httpx>=0.27,<1'  # into hermes' venv"
+        ),
         pii_safe=True,
         emoji="📞",
         allow_update_command=False,
@@ -137,11 +157,7 @@ def register(ctx) -> None:
 
 
 class VoiceAdapter(BasePlatformAdapter):
-    """Daily-room voice call adapter (standalone mode).
-
-    This agent holds DAILY_API_KEY, creates its own private room + meeting
-    token via the Daily REST API at connect time, joins immediately, and logs
-    the room URL for the owner to share.
+    """Daily-room voice adapter supporting standalone and orchestrated calls.
 
     One active call at a time (daily-python virtual devices are process-level
     singletons — see daily_transport.py).
@@ -152,22 +168,31 @@ class VoiceAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=platform)
         self._call_lock = asyncio.Lock()
         self._active_call: Optional[Dict[str, Any]] = None
+        self._control: Optional[control.VoiceControlClient] = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        # is_reconnect (base.py contract): we hold no server-side message
-        # queue — a dropped call is simply a new room on reconnect.
+        mode = _resolve_mode(self.config)
+        if mode not in ("standalone", "orchestrated"):
+            raise RuntimeError(f"unknown voice mode={mode!r}")
+
+        if mode == "orchestrated":
+            if self._control is None:
+                self._control = control.VoiceControlClient(
+                    os.environ["SECOND_BRAIN_SIGNALING_URL"].strip(),
+                    os.environ["SECOND_BRAIN_SIGNALING_KEY"].strip(),
+                    self._handle_control_command,
+                )
+            await self._control.start()
+            self._mark_connected()
+            return True
+
         # Standalone: create our own private room + tokens, join immediately.
-        # The room is private, so the shareable URL must carry an owner token —
-        # the bare room URL alone cannot join a private room.
+        # The room is private, so the shareable URL must carry an owner token.
         room_url, agent_token, share_url = await self._create_standalone_room()
         await self._start_call(room_url, agent_token)
         self._mark_connected()
-        # The join URL is the room's join permission (private room + owner
-        # token) — and it is a JWT, which hermes' RedactingFormatter mangles
-        # in every log handler (console and file). So the log line only
-        # ANNOUNCES the call; the actual URL is handed over redaction-free:
-        #   1. print() to stdout (bypasses logging formatters), and
-        #   2. written 0600 to <hermes home>/voice-call-url.txt.
+        # Logging formatters redact the token. Hand the URL over redaction-free
+        # through stdout and a mode-0600 file under the Hermes home.
         url_file = None
         try:
             from hermes_constants import get_hermes_home
@@ -190,7 +215,14 @@ class VoiceAdapter(BasePlatformAdapter):
             f" and written to {url_file}" if url_file else "")
         return True
 
-    async def _start_call(self, room_url: str, token: str) -> None:
+    async def _start_call(
+        self,
+        room_url: str,
+        token: str,
+        *,
+        call_id: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
         async with self._call_lock:
             if self._active_call is not None:
                 await self._end_call_locked("replaced-by-new-call")
@@ -272,10 +304,45 @@ class VoiceAdapter(BasePlatformAdapter):
             self._active_call = {
                 "stt": stt, "transport": transport, "loop": vloop,
                 "task": task, "tts_client": tts_client,
-                "started_at": time.monotonic(), "room_url": room_url}
+                "started_at": time.monotonic(), "room_url": room_url,
+                "call_id": call_id, "session_id": session_id,
+            }
             self._active_call["watchdog"] = asyncio.create_task(
                 self._call_watchdog(transport))
             logger.info("voice: call started in %s", room_url)
+
+    async def _handle_control_command(self, command: control.Command) -> None:
+        if command["type"] == "join_room":
+            try:
+                await self._start_call(
+                    command["roomUrl"],
+                    command["token"],
+                    call_id=command["callId"],
+                    session_id=command["sessionId"],
+                )
+            except Exception:
+                logger.exception("voice: orchestrated room join failed")
+                client = self._control
+                if client is not None:
+                    try:
+                        await client.post_event({
+                            "type": "error",
+                            "callId": command["callId"],
+                            "code": "agent_join_failed",
+                        })
+                    finally:
+                        await client.post_event({
+                            "type": "ended",
+                            "callId": command["callId"],
+                            "reason": "agent_join_failed",
+                        })
+            return
+
+        async with self._call_lock:
+            call = self._active_call
+            if call is None or call.get("call_id") != command["callId"]:
+                return
+            await self._end_call_locked("controller-request")
 
     async def _call_watchdog(self, transport) -> None:
         """Tear the call down when it is no longer worth paying for:
@@ -371,6 +438,11 @@ class VoiceAdapter(BasePlatformAdapter):
         # Durable + WARNING-level emit: this is the per-call cost record; it
         # must survive log levels/rotation on the agent volume.
         turn_loop.emit_telemetry(summary)
+        client = self._control
+        call_id = call.get("call_id")
+        if client is not None and call_id is not None:
+            await client.post_event({
+                "type": "ended", "callId": call_id, "reason": reason})
         logger.info("voice: call ended reason=%s", reason)
 
     async def _create_standalone_room(self) -> Tuple[str, str, str]:
@@ -406,7 +478,13 @@ class VoiceAdapter(BasePlatformAdapter):
         return room["url"], agent_token, share_url
 
     async def disconnect(self) -> None:
-        await self._end_call("adapter-disconnect")
+        try:
+            await self._end_call("adapter-disconnect")
+        finally:
+            client = self._control
+            self._control = None
+            if client is not None:
+                await client.close()
 
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
         """Out-of-band sends (cron etc.): speak if a call is live.

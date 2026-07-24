@@ -10,14 +10,16 @@ see HERMES_AGENT_SRC).
 """
 
 from __future__ import annotations
+import asyncio
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import PlatformConfig
 
 from hermes_voice import adapter as _adapter
+from hermes_voice import control
 from hermes_voice import cartesia_ink_stt as ink
 from hermes_voice import cartesia_tts as cartesia
 from hermes_voice import daily_transport
@@ -86,8 +88,7 @@ def test_register_registers_voice_platform():
     kwargs = ctx.register_platform.call_args.kwargs
     assert kwargs["name"] == "voice"
     assert kwargs["label"] == "Voice"
-    assert kwargs["required_env"] == [
-        "DAILY_API_KEY", "DEEPGRAM_API_KEY", "CARTESIA_API_KEY"]
+    assert kwargs["required_env"] == ["CARTESIA_API_KEY"]
     assert kwargs["pii_safe"] is True
     assert kwargs["allow_update_command"] is False
     for fn in ("check_fn", "validate_config", "is_connected", "adapter_factory"):
@@ -114,14 +115,14 @@ def test_adapter_factory_returns_voice_adapter():
     assert isinstance(adapter, _adapter.VoiceAdapter)
 
 
-def test_check_requirements_needs_transport_and_tts_keys(monkeypatch):
-    # Daily (transport) + Cartesia (TTS) are unconditional. The STT key is
-    # provider-dependent and deliberately NOT gated here (no config access) —
-    # DEEPGRAM_API_KEY stays unset throughout to prove that.
+def test_check_requirements_needs_shared_transport_and_tts(monkeypatch):
+    # Mode-specific signaling, Daily REST, STT, and voice selection are
+    # config-aware and deliberately not gated by this config-free hook.
     monkeypatch.setattr(_adapter, "_daily_available", lambda: True)
     monkeypatch.setattr(_adapter, "_websockets_available", lambda: True)
+    monkeypatch.delenv("DAILY_API_KEY", raising=False)
     monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
-    monkeypatch.setenv("DAILY_API_KEY", "dk")
+    monkeypatch.delenv("SECOND_BRAIN_SIGNALING_KEY", raising=False)
     monkeypatch.delenv("CARTESIA_API_KEY", raising=False)
     assert _adapter.check_requirements() is False
     monkeypatch.setenv("CARTESIA_API_KEY", "ck")
@@ -131,28 +132,496 @@ def test_check_requirements_needs_transport_and_tts_keys(monkeypatch):
 def test_check_requirements_false_without_deps(monkeypatch):
     monkeypatch.setattr(_adapter, "_daily_available", lambda: False)
     monkeypatch.setattr(_adapter, "_websockets_available", lambda: True)
-    monkeypatch.setenv("DAILY_API_KEY", "dk")
     monkeypatch.setenv("CARTESIA_API_KEY", "ck")
     assert _adapter.check_requirements() is False
 
 
-def test_validate_config_is_stt_provider_aware(monkeypatch):
-    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
-    monkeypatch.delenv("DAILY_API_KEY", raising=False)
-    flux_cfg = PlatformConfig(enabled=True, extra={})
-    ink_cfg = PlatformConfig(enabled=True,
-                             extra={"stt_provider": "cartesia_ink"})
-    # no transport key -> never valid
-    assert _adapter.validate_config(flux_cfg) is False
-    monkeypatch.setenv("DAILY_API_KEY", "dk")
-    # default provider is Flux -> Deepgram key required
-    assert _adapter.validate_config(flux_cfg) is False
-    monkeypatch.setenv("DEEPGRAM_API_KEY", "dg")
-    assert _adapter.validate_config(flux_cfg) is True
-    # Ink-2 rides the Cartesia key (already gated by check_requirements)
-    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
-    assert _adapter.validate_config(ink_cfg) is True
+def test_validate_config_is_mode_and_stt_provider_aware(monkeypatch):
+    for name in (
+        "DAILY_API_KEY", "DEEPGRAM_API_KEY", "CARTESIA_API_KEY",
+        "CARTESIA_VOICE_ID", "SECOND_BRAIN_SIGNALING_URL",
+        "SECOND_BRAIN_SIGNALING_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CARTESIA_API_KEY", "ck")
+    monkeypatch.setenv("CARTESIA_VOICE_ID", "voice")
 
+    standalone = PlatformConfig(enabled=True, extra={})
+    orchestrated = PlatformConfig(enabled=True, extra={"mode": "orchestrated"})
+    ink = PlatformConfig(enabled=True, extra={"stt_provider": "cartesia_ink"})
+    assert _adapter.validate_config(standalone) is False
+    monkeypatch.setenv("DAILY_API_KEY", "dk")
+    assert _adapter.validate_config(standalone) is False
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "dg")
+    assert _adapter.validate_config(standalone) is True
+    monkeypatch.delenv("DEEPGRAM_API_KEY")
+    assert _adapter.validate_config(ink) is True
+
+    # Orchestrated mode neither reads nor requires DAILY_API_KEY.
+    monkeypatch.delenv("DAILY_API_KEY")
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "dg")
+    assert _adapter.validate_config(orchestrated) is False
+    monkeypatch.setenv("SECOND_BRAIN_SIGNALING_URL", "https://signal.test/events")
+    monkeypatch.setenv("SECOND_BRAIN_SIGNALING_KEY", "signal-key")
+    assert _adapter.validate_config(orchestrated) is True
+    assert _adapter.validate_config(
+        PlatformConfig(enabled=True, extra={"mode": "invalid"})
+    ) is False
+
+def test_parse_command_rejects_malformed_and_unknown_keys():
+    assert control.parse_command(
+        '{"type":"leave_room","callId":"call-1"}'
+    ) == {"type": "leave_room", "callId": "call-1"}
+    bad_payloads = (
+        "[]",
+        '{"type":"unknown","callId":"call-1"}',
+        '{"type":"leave_room","callId":"call-1","extra":"x"}',
+        '{"type":"leave_room","callId":1}',
+        '{"type":"join_room","callId":"c","sessionId":"s",'
+        '"roomUrl":"u"}',
+    )
+    for payload in bad_payloads:
+        with pytest.raises(ValueError):
+            control.parse_command(payload)
+
+
+class _FakeControlResponse:
+    def __init__(self, status_code, lines=(), *, hold=False):
+        self.status_code = status_code
+        self.request = object()
+        self._lines = lines
+        self._hold = hold
+        self.holding = asyncio.Event()
+        self._release = asyncio.Event()
+        self.exited = False
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+        if self._hold:
+            self.holding.set()
+            await self._release.wait()
+
+
+class _FakeControlStream:
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        self._response.exited = True
+
+
+class _FakeControlHttpClient:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.stream_calls = []
+        self.post_calls = []
+        self.options = None
+        self.closed = False
+
+    def stream(self, method, url):
+        self.stream_calls.append((method, url))
+        return _FakeControlStream(self._responses.pop(0))
+
+    async def post(self, url, *, json):
+        self.post_calls.append((url, json))
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        return response
+
+    async def aclose(self):
+        self.closed = True
+
+
+def _install_control_http(monkeypatch, responses):
+    client = _FakeControlHttpClient(responses)
+
+    def factory(**options):
+        client.options = options
+        return client
+
+    monkeypatch.setattr(control.httpx, "AsyncClient", factory)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_control_start_blocks_until_first_http_200(monkeypatch):
+    responses = [
+        _FakeControlResponse(503),
+        _FakeControlResponse(200, hold=True),
+    ]
+    http_client = _install_control_http(monkeypatch, responses)
+    sleep_started = asyncio.Event()
+    resume_reconnect = asyncio.Event()
+
+    async def gated_sleep(delay):
+        sleep_started.set()
+        await resume_reconnect.wait()
+
+    monkeypatch.setattr(control.asyncio, "sleep", gated_sleep)
+    client = control.VoiceControlClient(
+        "https://signal.test/events", "secret", AsyncMock())
+    start_task = asyncio.create_task(client.start())
+    await sleep_started.wait()
+    assert start_task.done() is False
+
+    resume_reconnect.set()
+    await start_task
+
+    assert http_client.stream_calls == [
+        ("GET", "https://signal.test/events"),
+        ("GET", "https://signal.test/events"),
+    ]
+    assert http_client.options["headers"] == {"Authorization": "Bearer secret"}
+    await client.close()
+    assert responses[1].exited is True
+
+
+@pytest.mark.asyncio
+async def test_control_reconnect_backoff_resets_after_http_200(monkeypatch):
+    responses = [
+        _FakeControlResponse(503),
+        _FakeControlResponse(503),
+        _FakeControlResponse(200),
+        _FakeControlResponse(200, hold=True),
+    ]
+    _install_control_http(monkeypatch, responses)
+    real_sleep = asyncio.sleep
+    delays = []
+
+    async def record_sleep(delay):
+        delays.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(control.asyncio, "sleep", record_sleep)
+    monkeypatch.setattr(
+        control.random, "uniform", lambda low, high: (low + high) / 2)
+    client = control.VoiceControlClient(
+        "https://signal.test/events", "secret", AsyncMock())
+
+    await client.start()
+    await responses[3].holding.wait()
+
+    assert delays == [0.5, 1.0, 0.5]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_control_close_interrupts_open_stream(monkeypatch):
+    response = _FakeControlResponse(200, hold=True)
+    http_client = _install_control_http(monkeypatch, [response])
+    client = control.VoiceControlClient(
+        "https://signal.test/events", "secret", AsyncMock())
+    await client.start()
+    await response.holding.wait()
+
+    await client.close()
+
+    assert response.exited is True
+    assert http_client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_control_close_interrupts_backoff_sleep(monkeypatch):
+    _install_control_http(monkeypatch, [_FakeControlResponse(503)])
+    sleep_started = asyncio.Event()
+    sleep_cancelled = asyncio.Event()
+
+    async def blocked_sleep(delay):
+        sleep_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            sleep_cancelled.set()
+            raise
+
+    monkeypatch.setattr(control.asyncio, "sleep", blocked_sleep)
+    client = control.VoiceControlClient(
+        "https://signal.test/events", "secret", AsyncMock())
+    start_task = asyncio.create_task(client.start())
+    await sleep_started.wait()
+
+    await client.close()
+
+    assert sleep_cancelled.is_set() is True
+    with pytest.raises(RuntimeError, match="closed before connecting"):
+        await start_task
+
+
+@pytest.mark.asyncio
+async def test_control_post_event_is_strict_and_uses_same_url(monkeypatch):
+    http_client = _install_control_http(monkeypatch, [])
+    client = control.VoiceControlClient(
+        "https://signal.test/events", "secret", AsyncMock())
+
+    with pytest.raises(ValueError):
+        await client.post_event({
+            "type": "ended", "callId": "call-1", "reason": "left",
+            "extra": "rejected",
+        })
+    with pytest.raises(ValueError):
+        await client.post_event({
+            "type": "transcript", "callId": "call-1", "sessionId": "s",
+            "role": "user", "content": "hello", "final": False,
+        })
+    event = {"type": "ended", "callId": "call-1", "reason": "left"}
+    await client.post_event(event)
+
+    assert http_client.post_calls == [("https://signal.test/events", event)]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_standalone_connect_creates_and_joins_room(monkeypatch, tmp_path):
+    adapter = _adapter.VoiceAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._create_standalone_room = AsyncMock(
+        return_value=("https://room.test/r", "agent-token", "https://share.test/r")
+    )
+    adapter._start_call = AsyncMock()
+    adapter._mark_connected = MagicMock()
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+
+    assert await adapter.connect() is True
+    adapter._create_standalone_room.assert_awaited_once_with()
+    adapter._start_call.assert_awaited_once_with(
+        "https://room.test/r", "agent-token")
+
+
+@pytest.mark.asyncio
+async def test_orchestrated_connect_uses_signaling_without_daily(monkeypatch):
+    events = []
+
+    class FakeControl:
+        def __init__(self, url, bearer, on_command):
+            events.append(("init", url, bearer, on_command))
+
+        async def start(self):
+            events.append(("start",))
+
+        async def close(self):
+            events.append(("close",))
+
+    monkeypatch.delenv("DAILY_API_KEY", raising=False)
+    monkeypatch.setenv("SECOND_BRAIN_SIGNALING_URL", "https://signal.test/events")
+    monkeypatch.setenv("SECOND_BRAIN_SIGNALING_KEY", "signal-key")
+    monkeypatch.setattr(_adapter.control, "VoiceControlClient", FakeControl)
+    adapter = _adapter.VoiceAdapter(PlatformConfig(
+        enabled=True, extra={"mode": " Orchestrated "}))
+    adapter._create_standalone_room = AsyncMock()
+    adapter._mark_connected = MagicMock()
+
+    assert await adapter.connect() is True
+    adapter._create_standalone_room.assert_not_awaited()
+    assert events[0][:3] == (
+        "init", "https://signal.test/events", "signal-key")
+    assert events[1] == ("start",)
+
+
+@pytest.mark.asyncio
+async def test_join_room_passes_exact_control_fields():
+    adapter = _adapter.VoiceAdapter(PlatformConfig(
+        enabled=True, extra={"mode": "orchestrated"}))
+    adapter._start_call = AsyncMock()
+    command = {
+        "type": "join_room",
+        "callId": "call-1",
+        "sessionId": "session-1",
+        "roomUrl": "https://room.test/r",
+        "token": "agent-token",
+    }
+
+    await adapter._handle_control_command(command)
+
+    adapter._start_call.assert_awaited_once_with(
+        "https://room.test/r",
+        "agent-token",
+        call_id="call-1",
+        session_id="session-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_join_failure_posts_error_then_ended():
+    adapter = _adapter.VoiceAdapter(PlatformConfig(
+        enabled=True, extra={"mode": "orchestrated"}))
+    adapter._start_call = AsyncMock(side_effect=RuntimeError("join failed"))
+    control_client = MagicMock()
+    control_client.post_event = AsyncMock()
+    adapter._control = control_client
+
+    await adapter._handle_control_command({
+        "type": "join_room",
+        "callId": "call-1",
+        "sessionId": "session-1",
+        "roomUrl": "https://room.test/r",
+        "token": "agent-token",
+    })
+
+    assert [call.args[0] for call in control_client.post_event.await_args_list] == [
+        {"type": "error", "callId": "call-1", "code": "agent_join_failed"},
+        {"type": "ended", "callId": "call-1", "reason": "agent_join_failed"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_second_join_finishes_old_teardown_before_new_start(monkeypatch):
+    order = []
+
+    class FakeSTT:
+        provider = "fake-stt"
+        asr_seconds_est = 0.0
+
+        def __init__(self, label):
+            self.label = label
+
+        async def start(self):
+            order.append((self.label, "start"))
+
+        async def stop(self):
+            order.append((self.label, "stop"))
+
+        async def send_audio(self, pcm):
+            pass
+
+    class FakeTransport:
+        abnormal_end = None
+        remote_participant_count = 1
+
+        def __init__(self, loop=None, on_audio_in=None, *, label="new"):
+            self.label = label
+
+        async def join(self, room_url, token):
+            order.append((self.label, "join", room_url, token))
+
+        def begin_teardown(self):
+            order.append((self.label, "begin_teardown"))
+
+        async def leave(self):
+            order.append((self.label, "leave"))
+
+    class FakeTTS:
+        provider = "fake-tts"
+        model = "fake-model"
+        voice = "fake-voice"
+
+        def __init__(self, label):
+            self.label = label
+
+        async def connect(self):
+            order.append((self.label, "connect"))
+
+        async def close(self):
+            order.append((self.label, "close"))
+
+        def new_turn(self, on_audio):
+            raise AssertionError("no turn should start in this lifecycle test")
+
+    class FakeVoiceLoop:
+        def __init__(self, stt, tts_factory, transport, *, extra):
+            self.label = transport.label
+            self._run_forever = asyncio.Event()
+
+        async def run(self):
+            await self._run_forever.wait()
+
+        async def stop(self):
+            order.append((self.label, "loop_stop"))
+
+    def make_stt(provider, *, input_rate, extra):
+        order.append(("new", "create_stt"))
+        return FakeSTT("new")
+
+    def make_tts(provider, *, extra):
+        order.append(("new", "create_tts"))
+        return FakeTTS("new")
+
+    async def post_event(event):
+        order.append(("event", event))
+
+    monkeypatch.setattr(_adapter.stt_mod, "make_stt", make_stt)
+    monkeypatch.setattr(_adapter.daily_transport, "DailyTransport", FakeTransport)
+    monkeypatch.setattr(_adapter.tts_mod, "make_tts", make_tts)
+    monkeypatch.setattr(_adapter.turn_loop, "VoiceTurnLoop", FakeVoiceLoop)
+    monkeypatch.setattr(
+        _adapter.turn_loop, "emit_telemetry",
+        lambda summary: order.append(("telemetry", summary["reason"])),
+    )
+    adapter = _adapter.VoiceAdapter(PlatformConfig(
+        enabled=True, extra={"mode": "orchestrated"}))
+    control_client = MagicMock()
+    control_client.post_event = AsyncMock(side_effect=post_event)
+    adapter._control = control_client
+    old_task = asyncio.create_task(asyncio.Event().wait())
+    adapter._active_call = {
+        "stt": FakeSTT("old"),
+        "transport": FakeTransport(label="old"),
+        "loop": FakeVoiceLoop(
+            None, None, FakeTransport(label="old"), extra={}),
+        "task": old_task,
+        "tts_client": FakeTTS("old"),
+        "started_at": 0.0,
+        "room_url": "https://room.test/old",
+        "call_id": "old-call",
+        "session_id": "old-session",
+    }
+
+    await adapter._handle_control_command({
+        "type": "join_room",
+        "callId": "new-call",
+        "sessionId": "new-session",
+        "roomUrl": "https://room.test/new",
+        "token": "new-token",
+    })
+
+    old_leave = order.index(("old", "leave"))
+    ended = order.index(("event", {
+        "type": "ended",
+        "callId": "old-call",
+        "reason": "replaced-by-new-call",
+    }))
+    new_create = order.index(("new", "create_stt"))
+    assert old_leave < ended < new_create
+    assert adapter._active_call["call_id"] == "new-call"
+    assert adapter._active_call["session_id"] == "new-session"
+
+    adapter._control = None
+    await adapter._end_call("test-cleanup")
+
+
+@pytest.mark.asyncio
+async def test_stale_leave_room_is_noop():
+    adapter = _adapter.VoiceAdapter(PlatformConfig(
+        enabled=True, extra={"mode": "orchestrated"}))
+    adapter._active_call = {"call_id": "current-call"}
+    adapter._end_call_locked = AsyncMock()
+
+    await adapter._handle_control_command({
+        "type": "leave_room", "callId": "stale-call"})
+
+    adapter._end_call_locked.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_ends_media_before_control():
+    order = []
+    adapter = _adapter.VoiceAdapter(PlatformConfig(
+        enabled=True, extra={"mode": "orchestrated"}))
+
+    async def end_call(reason):
+        order.append(("media", reason))
+
+    control_client = MagicMock()
+    control_client.close = AsyncMock(side_effect=lambda: order.append(("control",)))
+    adapter._end_call = end_call
+    adapter._control = control_client
+
+    await adapter.disconnect()
+
+    assert order == [("media", "adapter-disconnect"), ("control",)]
 
 # --------------------------------------------------------------------------- #
 # Extra-config parsers

@@ -36,7 +36,7 @@ Either way, also make sure the plugin's own dependencies are importable in
 hermes' environment (the git route does not install them):
 
 ```bash
-pip install daily-python==0.29.1 'websockets>=14,<16'
+pip install daily-python==0.29.1 'websockets>=14,<16' 'httpx>=0.27,<1'
 ```
 
 Non-bundled plugins are **opt-in**: enable it once with
@@ -47,13 +47,14 @@ hermes plugins enable voice-platform
 
 (or add `voice-platform` to `plugins.enabled` in `config.yaml`).
 
-Set three keys in your `~/.hermes/.env` (all three services have free tiers):
+Every mode needs `CARTESIA_API_KEY` and a Cartesia voice selected through
+`CARTESIA_VOICE_ID` or `extra.cartesia_voice_id`. The selected STT provider
+also determines its credential: the default `deepgram_flux` needs
+`DEEPGRAM_API_KEY`; `cartesia_ink` reuses `CARTESIA_API_KEY`.
 
-| Key | Service | Used for |
-| --- | --- | --- |
-| `DAILY_API_KEY` | [Daily](https://dashboard.daily.co) | WebRTC transport (the agent mints its own room) |
-| `DEEPGRAM_API_KEY` | [Deepgram](https://console.deepgram.com) | Flux streaming STT + turn detection |
-| `CARTESIA_API_KEY` | [Cartesia](https://play.cartesia.ai) | streaming TTS |
+Standalone mode additionally needs `DAILY_API_KEY`. Orchestrated mode does
+not read that key; it instead requires `SECOND_BRAIN_SIGNALING_URL` and the
+dedicated bearer secret `SECOND_BRAIN_SIGNALING_KEY`.
 
 ## A faster model for voice (optional)
 
@@ -80,13 +81,15 @@ fails a live call.
 
 ## Configuration
 
-The plugin works with no extra config. To tune it:
+Standalone is the default. Set `extra.mode` to `orchestrated` only when an
+external controller owns room allocation. Other tuning is shared by both modes:
 
 ```yaml
 gateway:
   platforms:
     voice:
       extra:
+        mode: standalone             # or orchestrated
         stt_provider: deepgram_flux  # or cartesia_ink (rides the Cartesia key)
         tts_provider: cartesia       # the bundled TTS adapter
         cartesia_voice_id: ""        # Cartesia voice id (or set CARTESIA_VOICE_ID)
@@ -138,6 +141,16 @@ private, so the URL carries a short-lived owner **token** — that token is the
 join permission; share the URL only with people you want to reach your agent.
 The room is short-lived (~1 hour), and the agent ends the call automatically
 when the caller leaves, the room expires, or a maximum-duration cap is hit.
+
+### Orchestrated calls
+
+With `extra.mode: orchestrated`, startup opens an authenticated outbound SSE
+stream at `SECOND_BRAIN_SIGNALING_URL`; it does not create or join a room.
+The controller sends exact `join_room` commands containing `callId`,
+`sessionId`, `roomUrl`, and the agent token. `leave_room` names the active
+`callId`. Commands with missing, extra, or incorrectly typed fields are
+rejected. The same URL receives strict JSON event callbacks over authenticated
+POST requests. Only one call is active; a new join fully ends the old call.
 
 ## Notes
 

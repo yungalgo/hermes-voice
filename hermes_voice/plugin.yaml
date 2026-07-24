@@ -11,21 +11,32 @@ description: >
 
   Standalone mode: this agent holds DAILY_API_KEY and creates its own private
   room + single-use meeting token at startup, then logs a shareable URL.
+
+  Orchestrated mode: this agent opens an authenticated outbound signaling
+  stream and joins rooms assigned by the controller.
 author: yungalgo
 requires_env:
-  - name: DAILY_API_KEY
-    description: "Daily API key (WebRTC transport — agent creates its own room)"
-    prompt: "Daily API key"
-    password: true
-  - name: DEEPGRAM_API_KEY
-    description: "Deepgram API key (Flux streaming STT + turn detection — the default stt_provider; not needed with platforms.voice.extra.stt_provider: cartesia_ink)"
-    prompt: "Deepgram API key (skip if using stt_provider: cartesia_ink)"
-    password: true
   - name: CARTESIA_API_KEY
-    description: "Cartesia API key (streaming TTS)"
+    description: "Cartesia API key (streaming TTS and optional Ink STT)"
     prompt: "Cartesia API key"
     password: true
 optional_env:
+  - name: DAILY_API_KEY
+    description: "Daily API key (standalone mode only — agent creates its own room)"
+    prompt: "Daily API key (standalone mode only)"
+    password: true
+  - name: DEEPGRAM_API_KEY
+    description: "Deepgram API key (only for stt_provider: deepgram_flux)"
+    prompt: "Deepgram API key (skip for stt_provider: cartesia_ink)"
+    password: true
+  - name: SECOND_BRAIN_SIGNALING_URL
+    description: "Outbound SSE/POST endpoint (orchestrated mode only)"
+    prompt: "Second Brain signaling URL (orchestrated mode only)"
+    password: false
+  - name: SECOND_BRAIN_SIGNALING_KEY
+    description: "Dedicated bearer key for outbound signaling (orchestrated mode only)"
+    prompt: "Second Brain signaling key (orchestrated mode only)"
+    password: true
   - name: CARTESIA_VOICE_ID
     description: "Cartesia TTS voice id (or set platforms.voice.extra.cartesia_voice_id)"
     prompt: "Cartesia voice id (or empty for default)"
