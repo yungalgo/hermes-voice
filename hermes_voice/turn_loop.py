@@ -269,6 +269,7 @@ class VoiceTurnLoop:
         self._interrupt_latch: Optional[threading.Event] = None
         self._tts = None
         self._turn_task: Optional[asyncio.Task] = None
+        self._fatal_error: Optional[asyncio.Future] = None
         self._stopped = asyncio.Event()
         # Timing instrumentation: per-turn sequence + reference timestamp. All
         # voice/timing logs report ms since this reference.
@@ -423,22 +424,54 @@ class VoiceTurnLoop:
             target=_build, name="voice-agent-prewarm", daemon=True).start()
         return fut
 
+    def _schedule_turn(self, coroutine) -> asyncio.Task:
+        task = asyncio.create_task(coroutine)
+        self._turn_task = task
+        task.add_done_callback(self._turn_task_done)
+        return task
+
+    def _turn_task_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        fatal_error = self._fatal_error
+        if (error is not None and fatal_error is not None
+                and not fatal_error.done()):
+            fatal_error.set_result(error)
+
     # -- main ---------------------------------------------------------------
 
     async def run(self) -> None:
         await self._set_state(LISTENING)
+        loop = asyncio.get_running_loop()
+        fatal_error = loop.create_future()
+        self._fatal_error = fatal_error
         consumer = asyncio.create_task(self._consume_flux())
-        # Greetings are literal TTS, never hidden agent/control-prompt turns.
-        # Pre-warm the first real user turn's agent while the greeting plays.
-        self._spare_agent_future = self._preconstruct_agent()
-        self._turn_task = asyncio.create_task(
-            self._speak_canned(self._greeting))
-        await self._stopped.wait()
-        consumer.cancel()
+        stopped_waiter = asyncio.create_task(self._stopped.wait())
         try:
-            await consumer
-        except (asyncio.CancelledError, Exception):
-            pass
+            # Greetings are literal TTS, never hidden agent/control-prompt turns.
+            # Pre-warm the first real user turn's agent while the greeting plays.
+            self._spare_agent_future = self._preconstruct_agent()
+            self._schedule_turn(self._speak_canned(self._greeting))
+            done, _ = await asyncio.wait(
+                {stopped_waiter, fatal_error},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if fatal_error in done:
+                raise fatal_error.result()
+        finally:
+            if self._fatal_error is fatal_error:
+                self._fatal_error = None
+            stopped_waiter.cancel()
+            consumer.cancel()
+            for task in (stopped_waiter, consumer):
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     async def stop(self) -> None:
         await self._barge_in()           # kill any in-flight turn
@@ -465,6 +498,7 @@ class VoiceTurnLoop:
             raise
         except Exception:
             logger.exception("voice/turn: canned greeting failed")
+            raise
         finally:
             self._tts = None
             await self._set_state(LISTENING)
@@ -568,10 +602,9 @@ class VoiceTurnLoop:
         # Fresh latch BEFORE the task exists so a barge-in can never land
         # between turn creation and the executor publishing the agent.
         self._interrupt_latch = threading.Event()
-        self._turn_task = asyncio.create_task(
-            self._execute_turn(
-                user_message, record_user=record_user,
-                agent_future=agent_future))
+        self._schedule_turn(self._execute_turn(
+            user_message, record_user=record_user,
+            agent_future=agent_future))
 
     async def _execute_turn(self, user_message: str, *, record_user: bool,
                             agent_future=None) -> None:

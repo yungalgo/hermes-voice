@@ -506,7 +506,9 @@ async def test_voice_loop_failure_posts_error_then_ends_call():
     adapter._active_call = {"task": task, "call_id": "call-1"}
     adapter._end_call_locked = AsyncMock()
 
-    await adapter._handle_voice_task_failure(task)
+    adapter._voice_task_done(task)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
 
     control_client.post_event.assert_awaited_once_with({
         "type": "error", "callId": "call-1",
@@ -935,6 +937,47 @@ async def test_default_run_uses_literal_greeting_without_greeting_agent(monkeypa
 
     assert spoken == [turn_loop.DEFAULT_GREETING_TEXT]
     assert agent_turns == []
+
+
+@pytest.mark.asyncio
+async def test_run_propagates_canned_greeting_failure(monkeypatch):
+    async def fail_tts(on_audio):
+        raise RuntimeError("greeting tts failed")
+
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([]), fail_tts, _FakeTransport(), extra={})
+    monkeypatch.setattr(loop, "_preconstruct_agent", lambda: None)
+    run_task = asyncio.create_task(loop.run())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    loop._stopped.set()
+
+    with pytest.raises(RuntimeError, match="greeting tts failed"):
+        await run_task
+
+
+@pytest.mark.asyncio
+async def test_run_propagates_agent_turn_failure(monkeypatch):
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([]), _noop_tts_factory, _FakeTransport(), extra={})
+    monkeypatch.setattr(loop, "_preconstruct_agent", lambda: None)
+
+    async def speak_greeting(text):
+        pass
+
+    async def fail_turn(*args, **kwargs):
+        raise RuntimeError("agent turn failed")
+
+    monkeypatch.setattr(loop, "_speak_canned", speak_greeting)
+    monkeypatch.setattr(loop, "_execute_turn", fail_turn)
+    run_task = asyncio.create_task(loop.run())
+    await asyncio.sleep(0)
+    await loop._start_turn("hello", record_user=True)
+    await asyncio.sleep(0)
+    loop._stopped.set()
+
+    with pytest.raises(RuntimeError, match="agent turn failed"):
+        await run_task
 
 
 @pytest.mark.asyncio
