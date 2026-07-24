@@ -228,6 +228,11 @@ class VoiceAdapter(BasePlatformAdapter):
                 await self._end_call_locked("replaced-by-new-call")
             loop = asyncio.get_running_loop()
             extra = self.config.extra or {}
+            session_db = None
+            if session_id is not None:
+                from hermes_state import SessionDB
+
+                session_db = SessionDB()
 
             # STT: streaming ASR + model-integrated turn detection
             # (start/eager-end/resumed/end-of-turn events the turn loop reacts
@@ -298,14 +303,65 @@ class VoiceAdapter(BasePlatformAdapter):
                 await turn.open()
                 return turn
 
-            vloop = turn_loop.VoiceTurnLoop(
-                stt, tts_factory, transport, extra=extra)
+            async def on_status(status: str) -> None:
+                client = self._control
+                if client is not None and call_id is not None:
+                    await client.post_event({
+                        "type": "status",
+                        "callId": call_id,
+                        "status": status,
+                    })
+
+            async def on_transcript(role: str, content: str) -> None:
+                client = self._control
+                if (client is not None and call_id is not None
+                        and session_id is not None):
+                    await client.post_event({
+                        "type": "transcript",
+                        "callId": call_id,
+                        "sessionId": session_id,
+                        "role": role,
+                        "content": content,
+                        "final": True,
+                    })
+
+            try:
+                vloop = turn_loop.VoiceTurnLoop(
+                    stt,
+                    tts_factory,
+                    transport,
+                    extra=extra,
+                    session_id=session_id,
+                    session_db=session_db,
+                    on_status=on_status if call_id is not None else None,
+                    on_transcript=(
+                        on_transcript if call_id is not None else None),
+                )
+            except BaseException:
+                transport.begin_teardown()
+                try:
+                    await transport.leave()
+                except Exception:
+                    logger.warning(
+                        "voice: transport cleanup after session load failed",
+                        exc_info=True,
+                    )
+                try:
+                    await tts_client.close()
+                except Exception:
+                    pass
+                try:
+                    await stt.stop()
+                except Exception:
+                    pass
+                raise
             task = asyncio.create_task(vloop.run())
             self._active_call = {
                 "stt": stt, "transport": transport, "loop": vloop,
                 "task": task, "tts_client": tts_client,
                 "started_at": time.monotonic(), "room_url": room_url,
                 "call_id": call_id, "session_id": session_id,
+                "session_db": session_db,
             }
             self._active_call["watchdog"] = asyncio.create_task(
                 self._call_watchdog(transport))

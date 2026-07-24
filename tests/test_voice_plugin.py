@@ -11,6 +11,7 @@ see HERMES_AGENT_SRC).
 
 from __future__ import annotations
 import asyncio
+import threading
 
 from unittest.mock import AsyncMock, MagicMock
 
@@ -521,8 +522,9 @@ async def test_second_join_finishes_old_teardown_before_new_start(monkeypatch):
             raise AssertionError("no turn should start in this lifecycle test")
 
     class FakeVoiceLoop:
-        def __init__(self, stt, tts_factory, transport, *, extra):
+        def __init__(self, stt, tts_factory, transport, *, extra, **kwargs):
             self.label = transport.label
+            self.kwargs = kwargs
             self._run_forever = asyncio.Event()
 
         async def run(self):
@@ -542,6 +544,15 @@ async def test_second_join_finishes_old_teardown_before_new_start(monkeypatch):
     async def post_event(event):
         order.append(("event", event))
 
+    class FakeSessionDB:
+        def get_messages_as_conversation(
+                self, session_id, *, repair_alternation=False):
+            order.append(("new", "load_history", session_id,
+                          repair_alternation))
+            return []
+
+    import hermes_state
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
     monkeypatch.setattr(_adapter.stt_mod, "make_stt", make_stt)
     monkeypatch.setattr(_adapter.daily_transport, "DailyTransport", FakeTransport)
     monkeypatch.setattr(_adapter.tts_mod, "make_tts", make_tts)
@@ -587,6 +598,22 @@ async def test_second_join_finishes_old_teardown_before_new_start(monkeypatch):
     assert old_leave < ended < new_create
     assert adapter._active_call["call_id"] == "new-call"
     assert adapter._active_call["session_id"] == "new-session"
+    active_loop = adapter._active_call["loop"]
+    assert active_loop.kwargs["session_id"] == "new-session"
+    assert isinstance(active_loop.kwargs["session_db"], FakeSessionDB)
+    await active_loop.kwargs["on_status"]("thinking")
+    await active_loop.kwargs["on_transcript"]("user", "confirmed words")
+    assert ("event", {
+        "type": "status", "callId": "new-call", "status": "thinking",
+    }) in order
+    assert ("event", {
+        "type": "transcript",
+        "callId": "new-call",
+        "sessionId": "new-session",
+        "role": "user",
+        "content": "confirmed words",
+        "final": True,
+    }) in order
 
     adapter._control = None
     await adapter._end_call("test-cleanup")
@@ -687,8 +714,10 @@ async def test_eager_then_end_starts_a_single_turn(monkeypatch):
         {"event": "end_of_turn", "transcript": "hello there"},
     ])
     started = []
-    monkeypatch.setattr(loop, "_start_turn",
-                        lambda text, **k: started.append(text))
+    async def start_turn(text, **kwargs):
+        started.append(text)
+
+    monkeypatch.setattr(loop, "_start_turn", start_turn)
     await loop._consume_flux()
     # Eager starts the turn; the matching end_of_turn lets it stand (no restart).
     assert started == ["hello there"]
@@ -700,8 +729,10 @@ async def test_end_of_turn_without_eager_starts_turn(monkeypatch):
         {"event": "end_of_turn", "transcript": "what time is it"},
     ])
     started = []
-    monkeypatch.setattr(loop, "_start_turn",
-                        lambda text, **k: started.append(text))
+    async def start_turn(text, **kwargs):
+        started.append(text)
+
+    monkeypatch.setattr(loop, "_start_turn", start_turn)
     await loop._consume_flux()
     assert started == ["what time is it"]
 
@@ -758,7 +789,7 @@ async def test_turn_resumed_cancels_the_speculative_turn(monkeypatch):
         {"event": "eager_end_of_turn", "transcript": "hello"},
         {"event": "turn_resumed", "transcript": ""},
     ])
-    monkeypatch.setattr(loop, "_start_turn", lambda text, **k: None)
+    monkeypatch.setattr(loop, "_start_turn", AsyncMock())
     barged = []
 
     async def _fake_barge():
@@ -767,6 +798,223 @@ async def test_turn_resumed_cancels_the_speculative_turn(monkeypatch):
     monkeypatch.setattr(loop, "_barge_in", _fake_barge)
     await loop._consume_flux()
     assert barged == [True]   # the user kept talking -> kill the eager turn
+
+
+def test_supplied_session_loads_repaired_history_and_reaches_agent(monkeypatch):
+    class FakeSessionDB:
+        def __init__(self):
+            self.loads = []
+
+        def get_messages_as_conversation(
+                self, session_id, *, repair_alternation=False):
+            self.loads.append((session_id, repair_alternation))
+            return [{"role": "user", "content": "earlier"}]
+
+    session_db = FakeSessionDB()
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([]), _noop_tts_factory, _FakeTransport(), extra={},
+        session_id="session-from-web", session_db=session_db)
+    captured = {}
+
+    def create_agent(session_id, delta, tool, **kwargs):
+        captured.update(session_id=session_id, **kwargs)
+        return object()
+
+    monkeypatch.setattr(turn_loop, "_create_voice_agent", create_agent)
+    loop._make_agent()
+
+    assert loop._session_id == "session-from-web"
+    assert loop._history == [{"role": "user", "content": "earlier"}]
+    assert session_db.loads == [("session-from-web", True)]
+    assert captured["session_id"] == "session-from-web"
+    assert captured["session_db"] is session_db
+
+
+@pytest.mark.asyncio
+async def test_only_confirmed_end_emits_user_final(monkeypatch):
+    transcripts = []
+
+    async def on_transcript(role, content):
+        transcripts.append((role, content))
+
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([
+            {"event": "update", "transcript": "par"},
+            {"event": "eager_end_of_turn", "transcript": "partial"},
+            {"event": "turn_resumed", "transcript": "partial continued"},
+            {"event": "update", "transcript": "confirmed wor"},
+            {"event": "end_of_turn", "transcript": "confirmed words"},
+        ]),
+        _noop_tts_factory,
+        _FakeTransport(),
+        extra={},
+        on_transcript=on_transcript,
+    )
+    monkeypatch.setattr(loop, "_start_turn", AsyncMock())
+    monkeypatch.setattr(loop, "_barge_in", AsyncMock())
+
+    await loop._consume_flux()
+
+    assert transcripts == [("user", "confirmed words")]
+
+
+class _CompletedTurnTTS:
+    def __init__(self, order=None):
+        self.order = order
+        self.sent = []
+
+    async def send_text(self, text):
+        self.sent.append(text)
+
+    async def send_filler(self, text):
+        self.sent.append(text)
+
+    async def end(self):
+        if self.order is not None:
+            self.order.append("audible")
+
+    def mute(self):
+        pass
+
+    async def abort(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_completed_assistant_emits_once_with_state_order(monkeypatch):
+    states = []
+    transcripts = []
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([]),
+        lambda on_audio: asyncio.sleep(0, result=_CompletedTurnTTS()),
+        _FakeTransport(),
+        extra={},
+        on_status=lambda state: asyncio.sleep(0, result=states.append(state)),
+        on_transcript=lambda role, content: asyncio.sleep(
+            0, result=transcripts.append((role, content))),
+    )
+
+    class CompletedAgent:
+        def run_conversation(self, **kwargs):
+            loop._delta_tramp("Completed answer.")
+            return {"final_response": "Completed answer."}
+
+        def interrupt(self, reason):
+            pass
+
+    monkeypatch.setattr(loop, "_make_agent", lambda: CompletedAgent())
+
+    await loop._set_state(turn_loop.LISTENING)
+    await loop._start_turn("question", record_user=True)
+    await loop._turn_task
+
+    assert transcripts == [("assistant", "Completed answer.")]
+    assert states == ["listening", "thinking", "speaking", "listening"]
+
+
+@pytest.mark.asyncio
+async def test_speaking_waits_for_first_outbound_fragment(monkeypatch):
+    states = []
+    tts_open = asyncio.Event()
+    release_delta = threading.Event()
+
+    async def tts_factory(on_audio):
+        tts_open.set()
+        return _CompletedTurnTTS()
+
+    async def on_status(state):
+        states.append(state)
+
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([]), tts_factory, _FakeTransport(), extra={},
+        on_status=on_status)
+
+    class DelayedAgent:
+        def run_conversation(self, **kwargs):
+            release_delta.wait(1)
+            loop._delta_tramp("Ready now.")
+            return {"final_response": "Ready now."}
+
+        def interrupt(self, reason):
+            release_delta.set()
+
+    monkeypatch.setattr(loop, "_make_agent", lambda: DelayedAgent())
+
+    await loop._set_state(turn_loop.LISTENING)
+    await loop._start_turn("question", record_user=True)
+    await tts_open.wait()
+    assert states == ["listening", "thinking"]
+
+    release_delta.set()
+    await loop._turn_task
+    assert states == ["listening", "thinking", "speaking", "listening"]
+
+
+@pytest.mark.asyncio
+async def test_barged_assistant_does_not_emit_final(monkeypatch):
+    started = threading.Event()
+    released = threading.Event()
+    transcripts = []
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([]),
+        lambda on_audio: asyncio.sleep(0, result=_CompletedTurnTTS()),
+        _FakeTransport(),
+        extra={},
+        on_transcript=lambda role, content: asyncio.sleep(
+            0, result=transcripts.append((role, content))),
+    )
+
+    class InterruptedAgent:
+        def run_conversation(self, **kwargs):
+            started.set()
+            released.wait(1)
+            return {"final_response": "Not completed."}
+
+        def interrupt(self, reason):
+            released.set()
+
+    agent = InterruptedAgent()
+    monkeypatch.setattr(loop, "_make_agent", lambda: agent)
+
+    await loop._start_turn("interrupt me", record_user=True)
+    assert await asyncio.to_thread(started.wait, 1)
+    await loop._barge_in()
+
+    assert transcripts == []
+
+
+@pytest.mark.asyncio
+async def test_canned_greeting_persists_then_emits_after_audible_completion():
+    order = []
+
+    class FakeSessionDB:
+        def get_messages_as_conversation(self, session_id, **kwargs):
+            return []
+
+        def append_message(self, session_id, role, content=None):
+            order.append(("persist", session_id, role, content))
+
+    async def on_transcript(role, content):
+        order.append(("emit", role, content))
+
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([]),
+        lambda on_audio: asyncio.sleep(
+            0, result=_CompletedTurnTTS(order=order)),
+        _FakeTransport(),
+        extra={},
+        session_id="session-1",
+        session_db=FakeSessionDB(),
+        on_transcript=on_transcript,
+    )
+
+    await loop._speak_canned("Welcome.")
+
+    assert order == [
+        "audible",
+        ("persist", "session-1", "assistant", "Welcome."),
+        ("emit", "assistant", "Welcome."),
+    ]
 
 
 def test_resolve_bool_extra():
