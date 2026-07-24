@@ -73,6 +73,16 @@ _mic = None
 _speaker = None
 
 
+class _PlayoutReceipt:
+    """Queue marker completed by the writer at audible playout end."""
+
+    __slots__ = ("future", "generation", "cancelled")
+
+    def __init__(self, future: asyncio.Future, generation: int):
+        self.future = future
+        self.generation = generation
+        self.cancelled = threading.Event()
+
 def _is_local_participant(key: str, participant: dict) -> bool:
     """True for the agent's own entry in participants()/events. The local
     participant appears under the "local" key in participants() and carries
@@ -137,7 +147,7 @@ class DailyTransport:
         self._reader: Optional[threading.Thread] = None
         self._writer: Optional[threading.Thread] = None
         self._keepalive: Optional[threading.Thread] = None
-        self._out_q: "queue.Queue[Optional[bytes]]" = queue.Queue()
+        self._out_q: "queue.Queue[Optional[object]]" = queue.Queue()
         self._joined = threading.Event()
         self._join_error: Optional[str] = None
         self._last_audio_in_t = 0.0
@@ -158,6 +168,11 @@ class DailyTransport:
         # stamps the first real frame write after arming.
         self._first_write_t: Optional[float] = None
         self._write_mark_armed = False
+        self._output_lock = threading.Lock()
+        self._output_generation = 0
+        self._active_generation: Optional[int] = None
+        self._sealed_generation: Optional[int] = None
+        self._pending_receipts: set[_PlayoutReceipt] = set()
 
     async def join(self, room_url: str, token: str, timeout: float = 15.0) -> None:
         _ensure_daily()
@@ -316,6 +331,15 @@ class DailyTransport:
                         burst_audio_s, time.monotonic() - burst_t0)
                     burst_audio_s = 0.0
                 continue
+            if isinstance(chunk, _PlayoutReceipt):
+                completed = self._wait_for_playout_due(chunk, next_due)
+                self._retire_receipt(chunk, completed)
+                if burst_audio_s > 0.0:
+                    logger.info(
+                        "voice/daily: write burst ended audio_s=%.2f wall_s=%.2f",
+                        burst_audio_s, time.monotonic() - burst_t0)
+                    burst_audio_s = 0.0
+                continue
             if chunk is None:
                 continue
             now = time.monotonic()
@@ -338,6 +362,53 @@ class DailyTransport:
             next_due += chunk_s
             burst_audio_s += chunk_s
 
+    def _wait_for_playout_due(
+        self, receipt: _PlayoutReceipt, next_due: float
+    ) -> bool:
+        """Block the writer until the final written chunk has elapsed."""
+        delay = next_due - time.monotonic()
+        if delay > 0 and receipt.cancelled.wait(delay):
+            return False
+        return not receipt.cancelled.is_set()
+
+    def _deliver_receipt_result(
+        self, receipt: _PlayoutReceipt, completed: bool
+    ) -> None:
+        """Resolve on the event loop; a concurrent clear always wins."""
+        with self._output_lock:
+            if receipt not in self._pending_receipts:
+                return
+            self._pending_receipts.remove(receipt)
+            completed = (
+                completed
+                and not receipt.cancelled.is_set()
+                and self._active_generation == receipt.generation
+            )
+            if self._active_generation == receipt.generation:
+                self._active_generation = None
+                self._sealed_generation = None
+            if not receipt.future.done():
+                receipt.future.set_result(completed)
+
+    def _retire_receipt(
+        self, receipt: _PlayoutReceipt, completed: bool
+    ) -> None:
+        self._loop.call_soon_threadsafe(
+            self._deliver_receipt_result, receipt, completed)
+
+    async def wait_for_playout(self) -> bool:
+        """Acknowledge only after the current PCM generation has played."""
+        with self._output_lock:
+            generation = self._active_generation
+            if generation is None or self._sealed_generation == generation:
+                return False
+            future = self._loop.create_future()
+            receipt = _PlayoutReceipt(future, generation)
+            self._pending_receipts.add(receipt)
+            self._sealed_generation = generation
+            self._out_q.put(receipt)
+        return await future
+
     async def send_audio(self, pcm: bytes) -> None:
         """Queue agent speech (s16le mono 48 kHz) for the caller.
 
@@ -345,11 +416,19 @@ class DailyTransport:
         internal buffer tightly: barge-in's clear_output then leaves only
         ~one 80ms chunk of unstoppable audio regardless of the TTS provider's
         native chunk size (Cartesia emits ~190ms chunks)."""
-        if len(pcm) <= OUT_CHUNK_BYTES:
-            self._out_q.put(pcm)
+        if not pcm:
             return
-        for i in range(0, len(pcm), OUT_CHUNK_BYTES):
-            self._out_q.put(pcm[i:i + OUT_CHUNK_BYTES])
+        with self._output_lock:
+            if (self._active_generation is None
+                    or self._sealed_generation == self._active_generation):
+                self._output_generation += 1
+                self._active_generation = self._output_generation
+                self._sealed_generation = None
+            if len(pcm) <= OUT_CHUNK_BYTES:
+                self._out_q.put(pcm)
+                return
+            for i in range(0, len(pcm), OUT_CHUNK_BYTES):
+                self._out_q.put(pcm[i:i + OUT_CHUNK_BYTES])
 
     def reset_write_mark(self) -> None:
         """Arm the first_frame_written telemetry mark for a new turn."""
@@ -363,34 +442,43 @@ class DailyTransport:
         return self._first_write_t
 
     def is_playing(self) -> bool:
-        """True while agent audio is still queued to play out to the caller.
-
-        The turn loop flips its state back to LISTENING as soon as the TTS has
-        FINISHED SENDING audio (tts.end() returns when the last chunk is
-        queued), but the wall-clock writer then plays that audio out over the
-        following seconds. Barge-in must fire during this tail too — otherwise
-        the caller hears the agent talk over them with no way to cut it."""
-        return not self._out_q.empty()
+        """True while an output generation or its receipt remains active."""
+        with self._output_lock:
+            return (
+                self._active_generation is not None
+                or any(not receipt.cancelled.is_set()
+                       for receipt in self._pending_receipts)
+            )
 
     def clear_output(self) -> None:
-        """Barge-in: drop all queued (unplayed) agent audio."""
-        dropped = 0
-        try:
-            while True:
-                self._out_q.get_nowait()
-                dropped += 1
-        except queue.Empty:
-            pass
+        """Atomically invalidate output, drain PCM, and cancel receipts."""
+        with self._output_lock:
+            self._output_generation += 1
+            self._active_generation = None
+            self._sealed_generation = None
+            receipts = tuple(self._pending_receipts)
+            for receipt in receipts:
+                receipt.cancelled.set()
+            dropped = 0
+            try:
+                while True:
+                    item = self._out_q.get_nowait()
+                    if not isinstance(item, _PlayoutReceipt):
+                        dropped += 1
+            except queue.Empty:
+                pass
+        for receipt in receipts:
+            self._loop.call_soon_threadsafe(
+                self._deliver_receipt_result, receipt, False)
         logger.info("voice/daily: cleared %d queued chunks", dropped)
 
     def begin_teardown(self) -> None:
-        """Stop feeding billable keep-alive silence IMMEDIATELY. Called by
-        the adapter as the very first teardown step — before the turn loop,
-        STT, and transport are wound down (each of which can await) — so no
-        more ASR audio is paid for past this point."""
+        """Stop keep-alive input and cancel outbound playout immediately."""
         if not self._teardown.is_set():
             self._teardown.set()
-            logger.info("voice/daily: teardown begun — keep-alive stopped")
+            self.clear_output()
+            logger.info(
+                "voice/daily: teardown begun — keep-alive and playout stopped")
 
     async def leave(self) -> None:
         self._teardown.set()

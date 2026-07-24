@@ -55,18 +55,38 @@ class _FakeTransport:
         self._playing = playing
         self.cleared = 0
         self.first_write_t = None
+        self.playout = asyncio.Event()
+        self.playout.set()
+        self.playout_result = True
+        self.playout_wait_started = asyncio.Event()
+        self.playout_waiting = False
 
     def is_playing(self) -> bool:
         return self._playing
 
     def clear_output(self) -> None:
         self.cleared += 1
+        if self.playout_waiting:
+            self.playout_result = False
+            self.playout.set()
 
     def reset_write_mark(self) -> None:
         pass
 
     async def send_audio(self, pcm: bytes) -> None:
         pass
+
+    async def wait_for_playout(self) -> bool:
+        self.playout_waiting = True
+        self.playout_wait_started.set()
+        await self.playout.wait()
+        result = self.playout_result
+        self.playout_waiting = False
+        self.playout_result = True
+        self.playout = asyncio.Event()
+        self.playout.set()
+        self.playout_wait_started = asyncio.Event()
+        return result
 
 
 async def _noop_tts_factory(on_audio):  # never called: _start_turn is patched
@@ -895,25 +915,34 @@ def test_voice_agent_disables_redundant_tts_tool(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_dynamic_greeting_uses_nonpersistent_agent(monkeypatch):
+async def test_default_run_uses_literal_greeting_without_greeting_agent(monkeypatch):
+    spoken = []
+    agent_turns = []
     loop = turn_loop.VoiceTurnLoop(
         _FakeFluxSTT([]), _noop_tts_factory, _FakeTransport(), extra={})
-    monkeypatch.setattr(loop, "_start_turn", AsyncMock())
-    loop._stopped.set()
+
+    async def speak(text):
+        spoken.append(text)
+        loop._stopped.set()
+
+    monkeypatch.setattr(loop, "_speak_canned", speak)
+    monkeypatch.setattr(
+        loop, "_start_turn",
+        lambda *args, **kwargs: agent_turns.append((args, kwargs)))
+    monkeypatch.setattr(loop, "_preconstruct_agent", lambda: None)
 
     await loop.run()
 
-    loop._start_turn.assert_awaited_once_with(
-        turn_loop.DEFAULT_GREETING_PROMPT,
-        record_user=False,
-        persist_session=False,
-    )
+    assert spoken == [turn_loop.DEFAULT_GREETING_TEXT]
+    assert agent_turns == []
 
 
 @pytest.mark.asyncio
-async def test_nonpersistent_greeting_persists_only_completed_assistant(monkeypatch):
+async def test_canned_greeting_waits_for_playout_before_persisting_and_emitting():
     persisted = []
     transcripts = []
+    transport = _FakeTransport()
+    transport.playout.clear()
 
     class FakeSessionDB:
         def get_messages_as_conversation(self, session_id, **kwargs):
@@ -925,46 +954,35 @@ async def test_nonpersistent_greeting_persists_only_completed_assistant(monkeypa
     loop = turn_loop.VoiceTurnLoop(
         _FakeFluxSTT([]),
         lambda on_audio: asyncio.sleep(0, result=_CompletedTurnTTS()),
-        _FakeTransport(),
-        extra={},
+        transport,
+        extra={"greeting_text": "Welcome."},
         session_id="session-1",
         session_db=FakeSessionDB(),
         on_transcript=lambda role, content: asyncio.sleep(
             0, result=transcripts.append((role, content))),
     )
-    persistence_modes = []
 
-    class CompletedAgent:
-        def run_conversation(self, **kwargs):
-            loop._delta_tramp("Welcome.")
-            return {"final_response": "Welcome."}
+    task = asyncio.create_task(loop._speak_canned("Welcome."))
+    await transport.playout_wait_started.wait()
+    assert persisted == []
+    assert loop._history == []
+    assert transcripts == []
 
-        def interrupt(self, reason):
-            pass
+    transport.playout.set()
+    await task
 
-    def make_agent(*, persist_session=True):
-        persistence_modes.append(persist_session)
-        return CompletedAgent()
-
-    monkeypatch.setattr(loop, "_make_agent", make_agent)
-
-    await loop._start_turn(
-        turn_loop.DEFAULT_GREETING_PROMPT,
-        record_user=False,
-        persist_session=False,
-    )
-    await loop._turn_task
-
-    assert persistence_modes == [False, True]
     assert persisted == [("session-1", "assistant", "Welcome.")]
     assert loop._history == [{"role": "assistant", "content": "Welcome."}]
     assert transcripts == [("assistant", "Welcome.")]
 
 
 @pytest.mark.asyncio
-async def test_failed_greeting_playback_persists_nothing(monkeypatch):
+@pytest.mark.parametrize("interrupt", ["barge", "clear"])
+async def test_interrupted_canned_greeting_persists_nothing(interrupt):
     persisted = []
     transcripts = []
+    transport = _FakeTransport()
+    transport.playout.clear()
 
     class FakeSessionDB:
         def get_messages_as_conversation(self, session_id, **kwargs):
@@ -973,39 +991,24 @@ async def test_failed_greeting_playback_persists_nothing(monkeypatch):
         def append_message(self, session_id, role, content=None):
             persisted.append((session_id, role, content))
 
-    class FailedGreetingTTS(_CompletedTurnTTS):
-        async def end(self):
-            raise RuntimeError("playback failed")
-
     loop = turn_loop.VoiceTurnLoop(
         _FakeFluxSTT([]),
-        lambda on_audio: asyncio.sleep(0, result=FailedGreetingTTS()),
-        _FakeTransport(),
+        lambda on_audio: asyncio.sleep(0, result=_CompletedTurnTTS()),
+        transport,
         extra={},
         session_id="session-1",
         session_db=FakeSessionDB(),
         on_transcript=lambda role, content: asyncio.sleep(
             0, result=transcripts.append((role, content))),
     )
+    loop._turn_task = asyncio.create_task(
+        loop._speak_canned(turn_loop.DEFAULT_GREETING_TEXT))
+    await transport.playout_wait_started.wait()
 
-    class CompletedAgent:
-        def run_conversation(self, **kwargs):
-            loop._delta_tramp("Welcome.")
-            return {"final_response": "Welcome."}
-
-        def interrupt(self, reason):
-            pass
-
-    monkeypatch.setattr(
-        loop, "_make_agent",
-        lambda *, persist_session=True: CompletedAgent())
-
-    await loop._start_turn(
-        turn_loop.DEFAULT_GREETING_PROMPT,
-        record_user=False,
-        persist_session=False,
-    )
-    with pytest.raises(RuntimeError, match="playback failed"):
+    if interrupt == "barge":
+        await loop._barge_in()
+    else:
+        transport.clear_output()
         await loop._turn_task
 
     assert persisted == []
@@ -1042,8 +1045,7 @@ async def test_only_confirmed_end_emits_user_final(monkeypatch):
 
 
 class _CompletedTurnTTS:
-    def __init__(self, order=None):
-        self.order = order
+    def __init__(self):
         self.sent = []
 
     async def send_text(self, text):
@@ -1053,8 +1055,7 @@ class _CompletedTurnTTS:
         self.sent.append(text)
 
     async def end(self):
-        if self.order is not None:
-            self.order.append("audible")
+        pass
 
     def mute(self):
         pass
@@ -1200,36 +1201,38 @@ async def test_pre_audio_barge_carries_text_into_next_confirmed_turn(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_canned_greeting_persists_then_emits_after_audible_completion():
-    order = []
-
-    class FakeSessionDB:
-        def get_messages_as_conversation(self, session_id, **kwargs):
-            return []
-
-        def append_message(self, session_id, role, content=None):
-            order.append(("persist", session_id, role, content))
-
-    async def on_transcript(role, content):
-        order.append(("emit", role, content))
-
+async def test_normal_turn_waits_for_playout_before_emitting(monkeypatch):
+    transcripts = []
+    transport = _FakeTransport()
+    transport.playout.clear()
     loop = turn_loop.VoiceTurnLoop(
         _FakeFluxSTT([]),
-        lambda on_audio: asyncio.sleep(
-            0, result=_CompletedTurnTTS(order=order)),
-        _FakeTransport(),
+        lambda on_audio: asyncio.sleep(0, result=_CompletedTurnTTS()),
+        transport,
         extra={},
-        session_id="session-1",
-        session_db=FakeSessionDB(),
-        on_transcript=on_transcript,
+        on_transcript=lambda role, content: asyncio.sleep(
+            0, result=transcripts.append((role, content))),
     )
 
-    await loop._speak_canned("Welcome.")
+    class CompletedAgent:
+        def run_conversation(self, **kwargs):
+            loop._delta_tramp("Completed answer.")
+            return {"final_response": "Completed answer."}
 
-    assert order == [
-        "audible",
-        ("persist", "session-1", "assistant", "Welcome."),
-        ("emit", "assistant", "Welcome."),
+        def interrupt(self, reason):
+            pass
+
+    monkeypatch.setattr(loop, "_make_agent", lambda: CompletedAgent())
+    await loop._start_turn("question", record_user=True)
+    await transport.playout_wait_started.wait()
+    assert transcripts == []
+
+    transport.playout.set()
+    await loop._turn_task
+    assert transcripts == [("assistant", "Completed answer.")]
+    assert loop._history == [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "Completed answer."},
     ]
 
 
@@ -1349,6 +1352,139 @@ async def test_transport_is_playing_and_clear_output():
     t.clear_output()                      # barge-in drops queued audio
     assert t.is_playing() is False
 
+
+
+@pytest.mark.asyncio
+async def test_transport_playout_without_audio_is_not_acknowledged():
+    t = daily_transport.DailyTransport(asyncio.get_running_loop(), _noop_audio_in)
+
+    assert await t.wait_for_playout() is False
+
+@pytest.mark.asyncio
+async def test_transport_playout_receipt_waits_behind_final_chunk(monkeypatch):
+    reached_due = threading.Event()
+    release_due = threading.Event()
+    writes = []
+    monkeypatch.setattr(
+        daily_transport, "_mic",
+        type("Mic", (), {"write_frames": lambda self, pcm: writes.append(pcm)})())
+    t = daily_transport.DailyTransport(asyncio.get_running_loop(), _noop_audio_in)
+
+    def wait_for_due(receipt, next_due):
+        reached_due.set()
+        release_due.wait()
+        return not receipt.cancelled.is_set()
+
+    monkeypatch.setattr(t, "_wait_for_playout_due", wait_for_due)
+    t._running = True
+    writer = threading.Thread(target=t._write_loop, daemon=True)
+    writer.start()
+    await t.send_audio(b"\x00" * 200)
+    acknowledgement = asyncio.create_task(t.wait_for_playout())
+
+    assert await asyncio.to_thread(reached_due.wait, 1)
+    assert writes == [b"\x00" * 200]
+    assert acknowledgement.done() is False
+
+    release_due.set()
+    assert await acknowledgement is True
+    t._running = False
+    writer.join(1)
+
+
+@pytest.mark.asyncio
+async def test_transport_clear_output_cancels_playout_receipt(monkeypatch):
+    reached_due = threading.Event()
+    release_stale_receipt = threading.Event()
+    stale_receipt_retired = threading.Event()
+    monkeypatch.setattr(
+        daily_transport, "_mic",
+        type("Mic", (), {"write_frames": lambda self, pcm: None})())
+    t = daily_transport.DailyTransport(asyncio.get_running_loop(), _noop_audio_in)
+
+    def wait_for_due(receipt, next_due):
+        reached_due.set()
+        receipt.cancelled.wait()
+        release_stale_receipt.wait()
+        return False
+
+    original_retire = t._retire_receipt
+
+    def retire(receipt, completed):
+        original_retire(receipt, completed)
+        stale_receipt_retired.set()
+
+    monkeypatch.setattr(t, "_wait_for_playout_due", wait_for_due)
+    monkeypatch.setattr(t, "_retire_receipt", retire)
+    t._running = True
+    writer = threading.Thread(target=t._write_loop, daemon=True)
+    writer.start()
+    await t.send_audio(b"\x00" * 200)
+    acknowledgement = asyncio.create_task(t.wait_for_playout())
+
+    assert await asyncio.to_thread(reached_due.wait, 1)
+    t.clear_output()
+    assert await acknowledgement is False
+
+    await t.send_audio(b"\x01" * 200)
+    release_stale_receipt.set()
+    assert await asyncio.to_thread(stale_receipt_retired.wait, 1)
+    assert t.is_playing() is True
+    t._running = False
+    t.clear_output()
+    writer.join(1)
+
+
+@pytest.mark.asyncio
+async def test_transport_clear_serializes_with_receipt_registration(monkeypatch):
+    registration_inside_lock = threading.Event()
+    clear_attempting = threading.Event()
+    t = daily_transport.DailyTransport(asyncio.get_running_loop(), _noop_audio_in)
+    original_put = t._out_q.put
+
+    def gated_put(item):
+        if isinstance(item, daily_transport._PlayoutReceipt):
+            registration_inside_lock.set()
+            assert clear_attempting.wait(1)
+        original_put(item)
+
+    monkeypatch.setattr(t._out_q, "put", gated_put)
+    await t.send_audio(b"\x00" * 200)
+
+    def clear_concurrently():
+        assert registration_inside_lock.wait(1)
+        clear_attempting.set()
+        t.clear_output()
+
+    clearer = threading.Thread(target=clear_concurrently, daemon=True)
+    clearer.start()
+    assert await t.wait_for_playout() is False
+    clearer.join(1)
+    assert t.is_playing() is False
+
+
+
+@pytest.mark.asyncio
+async def test_transport_clear_wins_before_success_future_delivery(monkeypatch):
+    scheduled = []
+    t = daily_transport.DailyTransport(asyncio.get_running_loop(), _noop_audio_in)
+    monkeypatch.setattr(
+        t._loop, "call_soon_threadsafe",
+        lambda callback, *args: scheduled.append((callback, args)))
+    await t.send_audio(b"\x00" * 200)
+    acknowledgement = asyncio.create_task(t.wait_for_playout())
+    await asyncio.sleep(0)
+    receipt = next(iter(t._pending_receipts))
+
+    t._retire_receipt(receipt, True)
+    t.clear_output()
+    assert len(scheduled) == 2
+
+    callback, args = scheduled.pop(0)
+    callback(*args)
+    assert await acknowledgement is False
+    callback, args = scheduled.pop(0)
+    callback(*args)
 
 # --------------------------------------------------------------------------- #
 # Cartesia request builder (pure) + the <flush> mapping

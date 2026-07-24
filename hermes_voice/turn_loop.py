@@ -66,10 +66,7 @@ TTS_END_TIMEOUT_S = 30.0
 RUN_FUTURE_TIMEOUT_S = 60.0
 
 DEFAULT_ALLOW_INTERRUPTIONS = True
-DEFAULT_GREETING_PROMPT = (
-    "(The user just joined a voice call with you. Greet them by voice in "
-    "one short, warm sentence and ask how you can help.)"
-)
+DEFAULT_GREETING_TEXT = "Hi, how can I help?"
 DEFAULT_FILLER_TEXT = "One moment."
 
 LISTENING, THINKING, SPEAKING = "listening", "thinking", "speaking"
@@ -232,7 +229,7 @@ class VoiceTurnLoop:
         self._tts_factory = tts_factory
         self._transport = transport
         self._extra = extra or {}
-        self._greeting = self._extra.get("greeting_prompt") or DEFAULT_GREETING_PROMPT
+        self._greeting = self._extra.get("greeting_text") or DEFAULT_GREETING_TEXT
         self._filler = self._extra.get("filler_text") or DEFAULT_FILLER_TEXT
         supplied_session_id = session_id
         self._session_id = session_id or f"voice-{uuid.uuid4().hex[:12]}"
@@ -404,13 +401,12 @@ class VoiceTurnLoop:
             sink(event_type, tool_name=tool_name, preview=preview,
                  args=args, **kwargs)
 
-    def _make_agent(self, *, persist_session: bool = True):
+    def _make_agent(self):
         """Construct a turn agent (executor thread). Construction does not need
         the user message, so it can run before the turn starts."""
         return _create_voice_agent(
             self._session_id, self._delta_tramp, self._tool_tramp,
-            session_db=self._session_db if persist_session else None,
-            extra=self._extra)
+            session_db=self._session_db, extra=self._extra)
 
     def _preconstruct_agent(self) -> "concurrent.futures.Future":
         """Build the next turn's agent on a worker thread. Returns a concurrent
@@ -432,17 +428,11 @@ class VoiceTurnLoop:
     async def run(self) -> None:
         await self._set_state(LISTENING)
         consumer = asyncio.create_task(self._consume_flux())
-        canned = self._extra.get("greeting_text")
-        if canned:
-            # Canned greeting: instant TTS, no LLM round-trip. The first real
-            # turn's agent is pre-warmed while the greeting plays.
-            self._spare_agent_future = self._preconstruct_agent()
-            self._turn_task = asyncio.create_task(self._speak_canned(canned))
-        else:
-            # The control prompt is ephemeral. Persist only the completed
-            # assistant greeting after it has played audibly.
-            await self._start_turn(
-                self._greeting, record_user=False, persist_session=False)
+        # Greetings are literal TTS, never hidden agent/control-prompt turns.
+        # Pre-warm the first real user turn's agent while the greeting plays.
+        self._spare_agent_future = self._preconstruct_agent()
+        self._turn_task = asyncio.create_task(
+            self._speak_canned(self._greeting))
         await self._stopped.wait()
         consumer.cancel()
         try:
@@ -465,11 +455,12 @@ class VoiceTurnLoop:
             await self._set_state(SPEAKING)
             await self._tts.send_text(text)
             await asyncio.wait_for(self._tts.end(), timeout=TTS_END_TIMEOUT_S)
-            if self._session_db is not None:
-                self._session_db.append_message(
-                    self._session_id, "assistant", content=text)
-            self._history.append({"role": "assistant", "content": text})
-            await self._emit_transcript("assistant", text)
+            if await self._transport.wait_for_playout():
+                if self._session_db is not None:
+                    self._session_db.append_message(
+                        self._session_id, "assistant", content=text)
+                self._history.append({"role": "assistant", "content": text})
+                await self._emit_transcript("assistant", text)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -569,7 +560,7 @@ class VoiceTurnLoop:
     # -- agent turn ---------------------------------------------------------
 
     async def _start_turn(self, user_message: str, *, record_user: bool,
-                          agent_future=None, persist_session: bool = True) -> None:
+                          agent_future=None) -> None:
         await self._set_state(THINKING)
         if self._t_ref is None:          # greeting turn has no vad-end
             self._t_ref = time.monotonic()
@@ -580,11 +571,10 @@ class VoiceTurnLoop:
         self._turn_task = asyncio.create_task(
             self._execute_turn(
                 user_message, record_user=record_user,
-                agent_future=agent_future, persist_session=persist_session))
+                agent_future=agent_future))
 
     async def _execute_turn(self, user_message: str, *, record_user: bool,
-                            agent_future=None,
-                            persist_session: bool = True) -> None:
+                            agent_future=None) -> None:
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[tuple]" = asyncio.Queue()
         agent_ref = self._agent_ref
@@ -635,8 +625,7 @@ class VoiceTurnLoop:
                 agent = agent_future.result(timeout=RUN_FUTURE_TIMEOUT_S)
             else:
                 self._mark("agent-constructing")
-                agent = (self._make_agent() if persist_session
-                         else self._make_agent(persist_session=False))
+                agent = self._make_agent()
             agent_ref[0] = agent
             self._mark("agent-start")
             self._tel_set("agent_start")
@@ -682,7 +671,8 @@ class VoiceTurnLoop:
             try:
                 # end() blocks until the server's final audio; bounded wait.
                 await asyncio.wait_for(self._tts.end(), timeout=TTS_END_TIMEOUT_S)
-                playback_completed = True
+                if await self._transport.wait_for_playout():
+                    playback_completed = True
             except asyncio.TimeoutError:
                 logger.warning("voice/turn: tts end timed out; aborting socket")
                 await self._tts.abort()
@@ -715,10 +705,7 @@ class VoiceTurnLoop:
                 final = result.get("final_response", "")
                 if record_user:
                     self._history.append({"role": "user", "content": user_message})
-                if final and (persist_session or playback_completed):
-                    if not persist_session and self._session_db is not None:
-                        self._session_db.append_message(
-                            self._session_id, "assistant", content=final)
+                if final and playback_completed:
                     self._history.append({"role": "assistant", "content": final})
                     await self._emit_transcript("assistant", final)
             elif interrupted and record_user and not first_audio_seen:
